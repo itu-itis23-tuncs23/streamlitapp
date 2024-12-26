@@ -1,6 +1,5 @@
 import streamlit as st
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, pipeline
-import torchaudio
+from transformers import pipeline
 import torch
 
 # Streamlit run command: `streamlit run app.py`
@@ -10,14 +9,12 @@ import torch
 # ------------------------------
 @st.cache_resource
 def load_whisper_model():
-    """
-    Load the Whisper model and processor for audio transcription.
-    Returns:
-        tuple: (WhisperProcessor, WhisperForConditionalGeneration)
-    """
-    processor = WhisperProcessor.from_pretrained("openai/whisper-base")
-    model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
-    return processor, model
+    return pipeline(
+        "automatic-speech-recognition",
+        model="openai/whisper-tiny",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        return_timestamps=True
+    )
 
 
 # ------------------------------
@@ -25,92 +22,88 @@ def load_whisper_model():
 # ------------------------------
 @st.cache_resource
 def load_ner_model():
-    """
-    Load the Named Entity Recognition (NER) model pipeline.
-    Returns:
-        transformers pipeline
-    """
-    return pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english", grouped_entities=True)
+    return pipeline(
+        "ner",
+        model="dslim/bert-base-NER",
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    )
 
 
 # ------------------------------
 # Audio Preprocessing Function
 # ------------------------------
-def preprocess_audio(uploaded_file):
+def preprocess_audio(uploaded_file, whisper_pipeline):
     """
     Preprocess a .wav file for Whisper transcription.
     Args:
         uploaded_file: Uploaded .wav file.
     Returns:
-        torch.Tensor: Preprocessed audio waveform.
-        int: Sampling rate (16,000 Hz).
+        str: Transcribed text.
     """
-    # Load the audio file using torchaudio
-    waveform, sample_rate = torchaudio.load(uploaded_file)
-
-    # Resample to 16kHz if necessary
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
-        waveform = resampler(waveform)
-        sample_rate = 16000
-
-    # Convert to mono if the audio has multiple channels
-    if waveform.size(0) > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-
-    # Normalize the audio to the range [-1.0, 1.0]
-    waveform = waveform / waveform.abs().max()
-
-    return waveform, sample_rate
+    try:
+        # Using the whisper model pipeline to transcribe the WAV file
+        output = whisper_pipeline(uploaded_file.read()) 
+        transcription = output["text"]  # Extracting the transcription
+        return transcription
+    except Exception as e:
+        st.error(f"Error during transcription: {e}")
+        return ""
 
 
 # ------------------------------
 # Transcription Logic
 # ------------------------------
-def transcribe_audio(uploaded_file, processor, model):
+def transcribe_audio(uploaded_file, model):
     """
     Transcribe audio into text using the Whisper model.
     Args:
         uploaded_file: Audio file uploaded by the user.
-        processor: Whisper processor.
         model: Whisper model.
     Returns:
         str: Transcribed text from the audio file.
     """
-    # Preprocess the audio
-    waveform, sample_rate = preprocess_audio(uploaded_file)
-
-    # Prepare input for the Whisper model
-    inputs = processor(waveform.squeeze().numpy(), sampling_rate=sample_rate, return_tensors="pt")
-
-    # Generate transcription
-    transcription_ids = model.generate(**inputs)
-
-    # Decode the transcribed text
-    transcribed_text = processor.batch_decode(transcription_ids, skip_special_tokens=True)[0]
-
-    return transcribed_text
+    transcription = preprocess_audio(uploaded_file, model)
+    return transcription
 
 
 # ------------------------------
 # Entity Extraction
 # ------------------------------
 def extract_entities(text, ner_pipeline):
-    """
-    Extract entities from transcribed text using the NER model.
-    Args:
-        text (str): Transcribed text.
-        ner_pipeline: NER pipeline loaded from Hugging Face.
-    Returns:
-        dict: Grouped entities (ORGs, LOCs, PERs).
-    """
     entities = ner_pipeline(text)
-    grouped_entities = {"ORG": [], "LOC": [], "PER": []}
+    grouped_entities = {
+        "Organizations (ORGS)": set(),
+        "Locations (LOCs)": set(),
+        "Persons (PERs)": set()
+    }
+    
+    current_entity = ""
+    current_type = None
+    
     for entity in entities:
-        entity_type = entity["entity_group"]
-        if entity_type in grouped_entities:
-            grouped_entities[entity_type].append(entity["word"])
+        word = entity["word"].replace("##", "")  # Remove subword tokens
+        
+        if entity["entity"].startswith("B-"):
+            if current_entity and current_type:
+                # Add the cleaned entity to the correct category
+                grouped_entities[current_type].add(current_entity.strip())
+            current_entity = word  # Start a new entity
+            if "PER" in entity["entity"]:
+                current_type = "Persons (PERs)"
+            elif "ORG" in entity["entity"]:
+                current_type = "Organizations (ORGS)"
+            elif "LOC" in entity["entity"]:
+                current_type = "Locations (LOCs)"
+        elif entity["entity"].startswith("I-") and current_type:
+            # Continue the same entity, concatenate without extra spaces
+            current_entity += word if word.startswith("##") else f" {word}"
+    
+    # Add the last entity if it exists
+    if current_entity and current_type:
+        grouped_entities[current_type].add(current_entity.strip())
+    
     return grouped_entities
+
 
 
 # ------------------------------
@@ -124,29 +117,37 @@ def main():
     STUDENT_ID = "150230716"
     st.write(f"**{STUDENT_ID} - {STUDENT_NAME}**")
 
-    # Load models
-    processor, whisper_model = load_whisper_model()
-    ner_pipeline = load_ner_model()
-
     # Upload audio file
     uploaded_file = st.file_uploader("Upload a .wav file", type=["wav"])
+
+    # Load models
+    whisper_model = load_whisper_model()
+    ner_pipeline = load_ner_model()
 
     if uploaded_file is not None:
         # Transcribe audio
         with st.spinner("Transcribing audio..."):
-            transcription = transcribe_audio(uploaded_file, processor, whisper_model)
+            transcription = transcribe_audio(uploaded_file, whisper_model)
         st.success("Transcription completed!")
-        st.text_area("Transcribed Text", transcription, height=200)
+        st.header("Transcription:")
+        st.markdown(f'<div class="transcription-text">{transcription}</div>', unsafe_allow_html=True)
 
         # Extract entities
         with st.spinner("Extracting entities..."):
             entities = extract_entities(transcription, ner_pipeline)
         st.success("Entity extraction completed!")
 
-        # Display entities
-        st.subheader("Extracted Entities")
-        for entity_type, entity_list in entities.items():
-            st.write(f"**{entity_type}:** {', '.join(set(entity_list))}")
+        st.header("Extracted Entities:")
+        for entity_type, entity_set in entities.items():
+            if entity_set:
+                st.markdown(
+                    f'<div style="font-size: 20px; font-weight: bold; margin-top: 10px;">{entity_type}</div>',
+                    unsafe_allow_html=True
+                )
+                st.markdown('<div class="entity-items" style="margin-left: 10px;">', unsafe_allow_html=True)
+                for entity in sorted(entity_set):
+                    st.markdown(f'<div class="entity-item">• {entity}</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
